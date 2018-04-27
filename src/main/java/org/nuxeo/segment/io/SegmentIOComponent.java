@@ -1,32 +1,38 @@
 /*
- * (C) Copyright ${year} Nuxeo SA (http://nuxeo.com/) and contributors.
+ * (C) Copyright 2014-2017 Nuxeo SA (http://nuxeo.com/) and others.
  *
- * All rights reserved. This program and the accompanying materials
- * are made available under the terms of the GNU Lesser General Public License
- * (LGPL) version 2.1 which accompanies this distribution, and is available at
- * http://www.gnu.org/licenses/lgpl.html
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * Lesser General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  *
  * Contributors:
  *     <a href="mailto:tdelprat@nuxeo.com">Tiry</a>
+ *     Yannis JULIENNE
  */
 
 package org.nuxeo.segment.io;
 
 import java.io.Serializable;
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.joda.time.DateTime;
 import org.nuxeo.ecm.core.api.NuxeoPrincipal;
 import org.nuxeo.runtime.api.Framework;
 import org.nuxeo.runtime.model.ComponentContext;
@@ -35,7 +41,11 @@ import org.nuxeo.runtime.model.DefaultComponent;
 import org.osgi.framework.Bundle;
 
 import com.github.segmentio.Analytics;
-import com.github.segmentio.models.EventProperties;
+import com.github.segmentio.AnalyticsClient;
+import com.github.segmentio.flush.Flusher;
+import com.github.segmentio.models.Group;
+import com.github.segmentio.models.Options;
+import com.github.segmentio.models.Props;
 import com.github.segmentio.models.Traits;
 
 /**
@@ -53,6 +63,10 @@ public class SegmentIOComponent extends DefaultComponent implements SegmentIO {
 
     public final static String MAPPER_EP = "mapper";
 
+    public final static String INTEGRATIONS_EP = "integrations";
+
+    public final static String FILTERS_EP = "filters";
+
     protected boolean debugMode = false;
 
     protected Map<String, SegmentIOMapper> mappers;
@@ -63,7 +77,13 @@ public class SegmentIOComponent extends DefaultComponent implements SegmentIO {
 
     protected SegmentIOConfig config;
 
+    protected SegmentIOIntegrations integrationsConfig;
+
+    protected SegmentIOUserFilter userFilters;
+
     protected Bundle bundle;
+
+    protected Flusher flusher;
 
     public Bundle getBundle() {
         return bundle;
@@ -82,19 +102,21 @@ public class SegmentIOComponent extends DefaultComponent implements SegmentIO {
     }
 
     @Override
-    public void registerContribution(Object contribution,
-            String extensionPoint, ComponentInstance contributor)
-            throws Exception {
+    public void registerContribution(Object contribution, String extensionPoint, ComponentInstance contributor) {
         if (CONFIG_EP.equalsIgnoreCase(extensionPoint)) {
             config = (SegmentIOConfig) contribution;
         } else if (MAPPER_EP.equalsIgnoreCase(extensionPoint)) {
             SegmentIOMapper mapper = (SegmentIOMapper) contribution;
             mappers.put(mapper.name, mapper);
+        } else if (INTEGRATIONS_EP.equalsIgnoreCase(extensionPoint)) {
+            integrationsConfig = (SegmentIOIntegrations) contribution;
+        } else if (FILTERS_EP.equalsIgnoreCase(extensionPoint)) {
+            userFilters = (SegmentIOUserFilter) contribution;
         }
     }
 
     @Override
-    public void applicationStarted(ComponentContext context) throws Exception {
+    public void applicationStarted(ComponentContext context) {
         String key = getWriteKey();
         if (DEFAULT_DEBUG_KEY.equals(key)) {
             log.info("Run Segment.io in debug mode : nothing will be sent to the server");
@@ -121,78 +143,195 @@ public class SegmentIOComponent extends DefaultComponent implements SegmentIO {
         }
     }
 
+    @Override
     public String getWriteKey() {
         if (config != null) {
-            return config.writeKey;
+            if (config.writeKey != null) {
+                return config.writeKey;
+            }
         }
         return Framework.getProperty(WRITE_KEY, DEFAULT_DEBUG_KEY);
     }
 
+    @Override
+    public Map<String, String> getGlobalParameters() {
+        if (config != null) {
+            if (config.parameters != null) {
+                return config.parameters;
+            }
+        }
+        return new HashMap<>();
+    }
+
+    protected Flusher getFlusher() {
+        if (flusher == null) {
+            try {
+                AnalyticsClient client = Analytics.getDefaultClient();
+                Field field = client.getClass().getDeclaredField("flusher");
+                field.setAccessible(true);
+                flusher = (Flusher) field.get(client);
+            } catch (ReflectiveOperationException e) {
+                log.error("Unable to access SegmentIO Flusher via reflection", e);
+            }
+        }
+        return flusher;
+    }
+
+    @Override
     public void identify(NuxeoPrincipal principal) {
         identify(principal, null);
     }
 
+    @Override
+    public Map<String, Boolean> getIntegrations() {
+        if (integrationsConfig != null && integrationsConfig.integrations != null) {
+            return integrationsConfig.integrations;
+        }
+        return new HashMap<>();
+    }
+
+    /**
+     * Build common options for identify and track calls. These options contains the configured integrations values and
+     * the current timestamp.
+     *
+     * @return the builded {@link Options} object
+     */
+    protected Options buildOptions() {
+        Options options = new Options();
+        for (Entry<String, Boolean> integration : getIntegrations().entrySet()) {
+            options.setIntegration(integration.getKey(), integration.getValue());
+        }
+        return options.setTimestamp(new DateTime());
+    }
+
+    @Override
     public void identify(NuxeoPrincipal principal, Map<String, Serializable> metadata) {
 
         SegmentIODataWrapper wrapper = new SegmentIODataWrapper(principal, metadata);
 
-        if (Framework.isTestModeSet()) {
-            pushForTest("identify", wrapper.getUserId(), null, metadata);
+        if (!mustTrackprincipal(wrapper.getUserId())) {
+            if (log.isDebugEnabled()) {
+                log.debug("Skip user " + principal.getName());
+            }
+            return;
+        }
+
+        if (debugMode) {
+            if (log.isInfoEnabled()) {
+                log.info("send identify for " + wrapper.getUserId() + " with meta : " + metadata.toString());
+            }
         } else {
-            if (debugMode) {
-                log.info("send identify for " + wrapper.getUserId() + " with meta : "
-                        + metadata.toString());
-            } else {
+            if (log.isDebugEnabled()) {
                 log.debug("send identify with " + metadata.toString());
-                Traits traits = new Traits();
-                traits.putAll(wrapper.getMetadata());
-                Analytics.identify(wrapper.getUserId(), traits);
+            }
+            Traits traits = new Traits();
+            traits.putAll(wrapper.getMetadata());
+            Options options = buildOptions();
+            if (Framework.isTestModeSet()) {
+                pushForTest("identify", wrapper.getUserId(), traits, options);
+            } else {
+                Analytics.getDefaultClient().identify(wrapper.getUserId(), traits, options);
+            }
+
+            Map<String, Serializable> groupMeta = wrapper.getGroupMetadata();
+            if (groupMeta.size() > 0 && groupMeta.containsKey("id")) {
+                Traits gtraits = new Traits();
+                gtraits.putAll(groupMeta);
+                group((String) groupMeta.get("id"), wrapper.getUserId(), gtraits, options);
+            } else {
+                // automatic grouping
+                if (principal.getCompany() != null) {
+                    group(principal.getCompany(), wrapper.getUserId(), null, options);
+                } else if (wrapper.getMetadata().get("company") != null) {
+                    group((String) wrapper.getMetadata().get("company"), wrapper.getUserId(), null, options);
+                }
             }
         }
     }
 
-    protected void pushForTest(String action, String principalName,
-            String eventName, Map<String, Serializable> metadata) {
+    protected void group(String groupId, String userId, Traits traits, Options options) {
+        if (groupId == null || groupId.isEmpty()) {
+            return;
+        }
+
+        if (Framework.isTestModeSet()) {
+            pushForTest("group", userId, traits, options);
+        } else {
+            Flusher flusher = getFlusher();
+            if (flusher != null) {
+                Group grp = new Group(userId, groupId, traits, options);
+                flusher.enqueue(grp);
+            } else {
+                log.warn("Can not use Group API");
+            }
+        }
+    }
+
+    protected Map<String, Object> pushForTest(String action, String userId, Map<String, Object> metadata,
+            Options options) {
         Map<String, Object> data = new HashMap<>();
+        data.put("action", action);
+        data.put(SegmentIODataWrapper.PRINCIPAL_KEY, userId);
         if (metadata != null) {
             data.putAll(metadata);
         }
-        data.put("action", action);
-        if (eventName != null) {
-            data.put("eventName", eventName);
+        if (options != null) {
+            data.put("options", options);
         }
-        data.put(SegmentIODataWrapper.PRINCIPAL_KEY, principalName);
         testData.add(data);
+        return data;
+    }
+
+    protected void pushForTest(String action, String userId, String eventName, Map<String, Object> metadata,
+            Options options) {
+        Map<String, Object> data = pushForTest(action, userId, metadata, options);
+        data.put("eventName", eventName);
     }
 
     public List<Map<String, Object>> getTestData() {
         return testData;
     }
 
-    public void track(NuxeoPrincipal principal, String eventName) {
-        track(principal, null);
+    protected boolean mustTrackprincipal(String principalName) {
+        SegmentIOUserFilter filter = getUserFilters();
+        if (filter == null) {
+            return true;
+        }
+        return filter.canTrack(principalName);
     }
 
-    public void track(NuxeoPrincipal principal, String eventName,
-            Map<String, Serializable> metadata) {
+    @Override
+    public void track(NuxeoPrincipal principal, String eventName, Map<String, Serializable> metadata) {
 
         SegmentIODataWrapper wrapper = new SegmentIODataWrapper(principal, metadata);
 
-        if (Framework.isTestModeSet()) {
-            pushForTest("track", wrapper.getUserId(), eventName, metadata);
+        if (!mustTrackprincipal(wrapper.getUserId())) {
+            if (log.isDebugEnabled()) {
+                log.debug("Skip user " + principal.getName());
+            }
+            return;
+        }
+
+        if (debugMode) {
+            if (log.isInfoEnabled()) {
+                log.info("send track for " + eventName + " user : " + wrapper.getUserId() + " with meta : "
+                        + metadata.toString());
+            }
         } else {
-            if (debugMode) {
-                log.info("send track for " + eventName + " user : " + wrapper.getUserId()
-                        + " with meta : " + metadata.toString());
-            } else {
+            if (log.isDebugEnabled()) {
                 log.debug("send track with " + metadata.toString());
-                EventProperties eventProperties = new EventProperties();
-                eventProperties.putAll(wrapper.getMetadata());
-                Analytics.track(wrapper.getUserId(), eventName, eventProperties);
+            }
+            Props eventProperties = new Props();
+            eventProperties.putAll(wrapper.getMetadata());
+            if (Framework.isTestModeSet()) {
+                pushForTest("track", wrapper.getUserId(), eventName, eventProperties, buildOptions());
+            } else {
+                Analytics.getDefaultClient().track(wrapper.getUserId(), eventName, eventProperties, buildOptions());
             }
         }
     }
 
+    @Override
     public void flush() {
         if (!debugMode) {
             // only flush if Analytics was actually initialized
@@ -200,6 +339,7 @@ public class SegmentIOComponent extends DefaultComponent implements SegmentIO {
         }
     }
 
+    @Override
     public Map<String, List<SegmentIOMapper>> getMappers(List<String> events) {
         Map<String, List<SegmentIOMapper>> targetMappers = new HashMap<String, List<SegmentIOMapper>>();
         for (String event : events) {
@@ -210,11 +350,23 @@ public class SegmentIOComponent extends DefaultComponent implements SegmentIO {
         return targetMappers;
     }
 
+    @Override
     public Set<String> getMappedEvents() {
         return event2Mappers.keySet();
     }
 
+    @Override
     public Map<String, List<SegmentIOMapper>> getAllMappers() {
         return event2Mappers;
+    }
+
+    @Override
+    public SegmentIOUserFilter getUserFilters() {
+        return userFilters;
+    }
+
+    @Override
+    public boolean isDebugMode() {
+        return debugMode;
     }
 }

@@ -27,6 +27,26 @@
       class="org.nuxeo.segment.io.SegmentIOMapper" />
   </extension-point>
 
+  <extension-point name="integrations">
+    <documentation>
+      Allows to configure segment.io integrations configuration.
 
+      See https://segment.com/docs/sources/server/java/#selecting-integrations
+
+      @author Thierry Delprat (td@nuxeo.com)
+    </documentation>
+    <object
+      class="org.nuxeo.segment.io.SegmentIOIntegrations" />
+  </extension-point>
+
+  <extension-point name="filters">
+    <documentation>
+      Allows to filter out events associated with particular users
+
+      @author Thierry Delprat (td@nuxeo.com)
+    </documentation>
+    <object
+      class="org.nuxeo.segment.io.SegmentIOUserFilter" />
+  </extension-point>
 
 </component>
